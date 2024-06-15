@@ -33,6 +33,7 @@ from ai_base import State, Action, Pos
 from ai_random import RandomMove
 from ai_qlearning import Q_Learning
 from ai_sarsa import SARSA
+from ai_DQN import DeepQLearning
 
 ## switches
 SHOW_ANIMATION = 0   # 1:Yes, 0:No
@@ -475,8 +476,9 @@ def main_loop(ai):
 
 ## choose a strategy below
 #ai = RandomMove()
-ai = Q_Learning(exploration=EXPLORATION)
+#ai = Q_Learning(exploration=EXPLORATION)
 #ai = SARSA(exploration=EXPLORATION)
+ai = DeepQLearning(exploration=EXPLORATION)
 print(f"Runnning {ai.name} algorithm...")
 if not EXPLORATION: print("- NO exploration mode is in place")
 
