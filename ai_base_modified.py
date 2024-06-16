@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Jun 16 19:10:10 2024
-
-@author: Akshay D Nair
-"""
 
 '''
 This is the AI base class. This module contains:
