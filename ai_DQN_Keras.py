@@ -9,7 +9,7 @@ from keras.optimizers import Adam
 from ai_base import State, Action, RL, DecayingFloat,SystemState
 
 
-class DeepQLearningVAC(RL):
+class DeepQLearning(RL):
     def __init__(self, exploration=True):
         super().__init__("Deep-Q-Learning")
         self.is_exploration = exploration
