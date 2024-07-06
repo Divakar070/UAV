@@ -47,11 +47,11 @@ SAMPLE_INTERVAL = 10000  # number of interval for each sampling, in this mode,
                          # during the sampling, the sim performs full exploitation
 
 ## stateless mode
-SHOW_ANIMATION = 1
-LOAD_DATA      = 0 # don't load 
-SAVE_DATA      = 0 # don't save
-EXPLORATION    = 1
-SAMPLE_MODE    = 0 # don't sample
+#SHOW_ANIMATION = 1
+#LOAD_DATA      = 0 # don't load 
+#SAVE_DATA      = 0 # don't save
+#EXPLORATION    = 1
+#SAMPLE_MODE    = 0 # don't sample
 
 ## check result mode
 # SHOW_ANIMATION = 1
@@ -61,11 +61,11 @@ SAMPLE_MODE    = 0 # don't sample
 # SAMPLE_MODE    = 0 # don't sample
 
 ## continue progress mode
-# SHOW_ANIMATION = 0 # no animation please
-# LOAD_DATA      = 1 # load progress
-# SAVE_DATA      = 1 # also save progress
-# EXPLORATION    = 1
-# SAMPLE_MODE    = 1 # sample outcome
+ SHOW_ANIMATION = 0 # no animation please
+ LOAD_DATA      = 1 # load progress
+ SAVE_DATA      = 1 # also save progress
+ EXPLORATION    = 1
+ SAMPLE_MODE    = 1 # sample outcome
 
 #############################################
 ## setup the simulation world
