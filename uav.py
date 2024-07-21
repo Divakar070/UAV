@@ -34,7 +34,7 @@ from ai_random import RandomMove
 #from ai_qlearning import Q_Learning
 # from ai_sarsa import SARSA
 #from ai_DQN import DeepQLearning
-from ai_DQN_pytorch import viv_DeepQLearning
+from ai_DQN import viv_DeepQLearning
 
 ## switches
 SHOW_ANIMATION = 0  # 1:Yes, 0:No
