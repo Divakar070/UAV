@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,54 +6,85 @@ import random
 import json, os
 from time import strftime, localtime
 
-#Importing necessary classes from ai_base
+# Importing necessary classes from ai_base
 from ai_base import State, Action, RL, DecayingFloat
 
+
+def scale_reward(self, reward):
+    return reward / 100.0  # Adjust the divisor based on your reward scale
+
+
 class DQNNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    # def __init__(self, input_dim, output_dim):
+    #     super(DQNNetwork, self).__init__()
+    #     self.fc1 = nn.Linear(input_dim, 128)
+    #     self.fc2 = nn.Linear(128, 128)
+    #     self.fc3 = nn.Linear(128, output_dim)
+
+    # def forward(self, x):
+    #     x = torch.relu(self.fc1(x))
+    #     x = torch.relu(self.fc2(x))
+    #     x = self.fc3(x)
+    #     return x
+    def __init__(self, input_dim, output_dim):  # complexified the network
         super(DQNNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, output_dim)
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.fc5 = nn.Linear(128, 64)
+        self.fc6 = nn.Linear(64, output_dim)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = torch.relu(self.fc3(x))
+        x = torch.relu(self.fc4(x))
+        x = torch.relu(self.fc5(x))
+        x = self.fc6(x)
         return x
 
-class DeepQLearning(RL):
+
+class viv_DeepQLearning(RL):
     def __init__(self, exploration=True):
         super().__init__("Deep-Q-Learning")
         self.is_exploration = exploration
-        
+
         self.state_dim = 3  # (col, row, step)
         self.action_dim = Action.COUNT
         self.q_network = DQNNetwork(self.state_dim, self.action_dim)
         self.target_network = DQNNetwork(self.state_dim, self.action_dim)
         self.target_network.load_state_dict(self.q_network.state_dict())
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=0.001)
+        # self.optimizer = optim.Adam(self.q_network.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(self.q_network.parameters(),
+                                    lr=0.001)  # could change the lr, didnt do much, lower the better
         self.criterion = nn.MSELoss()
-        
+
         self.memory = []
-        self.memory_size = 10000
-        self.batch_size = 64
-        self.gamma = 0.99
-        self.epsilon = DecayingFloat(value=0.9, factor=1.0-1e-6, minval=0.05)
-        self.target_update_frequency = 1000
+        # self.memory_size = 10000
+        # self.batch_size = 64
+        self.memory_size = 10000000  # increased the memory and decreased the batch size
+        self.batch_size = 32
+        self.gamma = 0.999
+        # self.epsilon = DecayingFloat(value=0.9, factor=1.0-1e-6, minval=0.05)
+        self.epsilon = DecayingFloat(value=0.9, factor=1.0 - 1e-5, minval=0.005)  # changed the decay rate
+        # self.target_update_frequency = 1000
+        self.target_update_frequency = 10000  # update lowered to 100
+        # self.target_update_frequency = 10 # update lowered to 100
         self.steps_done = 0
-        
+
         self.current_state = None
         self.current_action = None
 
     def store_transition(self, state, action, reward, next_state):
         if len(self.memory) >= self.memory_size:
             self.memory.pop(0)
+        reward = scale_reward(self, reward)  # reward scaling added added
         self.memory.append((state, action, reward, next_state))
 
     def sample_memory(self):
         return random.sample(self.memory, self.batch_size)
-    
+
     def state_to_tensor(self, state):
         return torch.tensor([state.col, state.row, state.step], dtype=torch.float32)
 
@@ -77,36 +107,38 @@ class DeepQLearning(RL):
             return
         transitions = self.sample_memory()
         batch_state, batch_action, batch_reward, batch_next_state = zip(*transitions)
-        
+
         batch_state = torch.stack([self.state_to_tensor(s) for s in batch_state])
         batch_action = torch.tensor(batch_action)
         batch_reward = torch.tensor(batch_reward)
         batch_next_state = torch.stack([self.state_to_tensor(s) for s in batch_next_state])
-        
+
         current_q_values = self.q_network(batch_state).gather(1, batch_action.unsqueeze(1)).squeeze(1)
         next_q_values = self.target_network(batch_next_state).max(1)[0].detach()
         expected_q_values = batch_reward + (self.gamma * next_q_values)
-        
+
         loss = self.criterion(current_q_values, expected_q_values)
-        
+
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)  # new line normalization
         self.optimizer.step()
 
     def execute(self, state, reward) -> int:
         if self.current_state is not None:
+            reward = scale_reward(self, reward)  # reward scaling added
             self.store_transition(self.current_state, self.current_action, reward, state)
             self.optimize_model()
             if self.steps_done % self.target_update_frequency == 0:
                 self.update_target_network()
-        
+
         self.current_action = self.choose_action(state)
         self.current_state = state
         self.steps_done += 1
-        
+
         if isinstance(self.epsilon, DecayingFloat):
             self.epsilon.decay()
-        
+
         return self.current_action
 
     def load_data(self) -> int:
