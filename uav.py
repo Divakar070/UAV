@@ -448,7 +448,7 @@ def main_loop(ai):
 
             ## return too early? then apply penalty
             if sim.uav_pos == UAV.END_POS:
-                reward -= reward * (UAV.FLIGHT_TIME - STAT.step) * 10 # penalty
+                reward -= reward * (UAV.FLIGHT_TIME - STAT.step) # penalty
 
             ## not reaching the end position at the end of the flight time?
             if STAT.step == UAV.FLIGHT_TIME and not sim.uav_pos == UAV.END_POS:
