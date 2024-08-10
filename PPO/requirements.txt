@@ -1,0 +1,13 @@
+numpy==1.26.4
+pygame==2.5.2
+shapely==2.0.4
+keras==3.3.3
+pip==24.0
+setuptools==65.5.0
+shapely==2.0.4
+pandas==2.2.2
+pillow==10.3.0
+torch==2.3.1
+tensorflow==2.16.1
+wheel==0.43.0
+sympy==1.12.1
