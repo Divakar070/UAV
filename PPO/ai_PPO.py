@@ -1,14 +1,81 @@
 import json
+import math
 import os
 
 import numpy as np
 import torch as T
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+from torch.optim.optimizer import Optimizer
 
 from ai_base import RL, Action, DecayingFloat, State
+
+
+class AdaptivePGD(Optimizer):
+    def __init__(
+            self,
+            params,
+            lr=0.15,
+            sigma=1.0,
+            beta1=0.9,
+            beta2=0.999,
+            damping=1e-8,
+    ):
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= damping:
+            raise ValueError("Invalid damping value: {}".format(damping))
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(beta1))
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(beta2))
+
+        names, params = zip(*params)
+
+        defaults = dict(
+            lr=lr, beta1=beta1, beta2=beta2, damping=damping, sigma=sigma, names=names
+        )
+
+        super(AdaptivePGD, self).__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            for name, p in zip(group["names"], group["params"]):
+                if 'gate' in name:
+                    continue
+                state = self.state[p]
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = T.zeros_like(p.data)
+                    # Exponential moving average of gradient^2 values
+                    state["exp_avg_sq"] = T.zeros_like(p.data)
+                    # noise
+                    state["prev_noise"] = T.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+
+                beta1, beta2 = group["beta1"], group["beta2"]
+
+                state["step"] += 1
+
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(p.grad.data, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).add_(
+                    p.grad.data ** 2, alpha=1 - beta2
+                )
+                bias_correction1 = 1 - beta1 ** state["step"]
+                bias_correction2 = 1 - beta2 ** state["step"]
+
+                denom = ((exp_avg_sq.sqrt()) / math.sqrt(bias_correction2)).add_(
+                    group["damping"]
+                )
+
+                noise = T.randn_like(p.grad) * group["sigma"]
+                perturbed_adaptive_grad = exp_avg / denom / bias_correction1 + noise
+                p.data.add_(perturbed_adaptive_grad, alpha=-group["lr"])
 
 
 def orthogonal_init(layer, gain=1.0):
@@ -16,123 +83,6 @@ def orthogonal_init(layer, gain=1.0):
         nn.init.orthogonal_(layer.weight, gain=gain)
         if layer.bias is not None:
             nn.init.constant_(layer.bias, 0)
-
-
-class ProgressiveColumn(nn.Module):
-    def __init__(self, input_dims, output_dims, alpha, fc1_dims=128, fc2_dims=128, prev_columns=None):
-        super(ProgressiveColumn, self).__init__()
-
-        self.fc1 = nn.Linear(input_dims, fc1_dims)
-        self.fc2 = nn.Linear(fc1_dims + (fc1_dims * len(prev_columns) if prev_columns else 0), fc2_dims)
-        self.fc3 = nn.Linear(fc2_dims + (fc2_dims * len(prev_columns) if prev_columns else 0), output_dims)
-
-        self.prev_columns = prev_columns if prev_columns else []
-
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.apply(orthogonal_init)
-        self.to(self.device)
-
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-
-        lateral_connections1 = [F.relu(col.fc1(state)) for col in self.prev_columns]
-        if lateral_connections1:
-            x = T.cat([x] + lateral_connections1, dim=1)
-
-        x = F.relu(self.fc2(x))
-
-        lateral_connections2 = [F.relu(col.fc2(T.cat([F.relu(col.fc1(state))] +
-                                                     [F.relu(prev_col.fc1(state)) for prev_col in col.prev_columns],
-                                                     dim=1)))
-                                for col in self.prev_columns]
-        if lateral_connections2:
-            x = T.cat([x] + lateral_connections2, dim=1)
-
-        return self.fc3(x)
-
-
-class ProgressiveActorNetwork(nn.Module):
-    def __init__(self, n_actions, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='ppo'):
-        super(ProgressiveActorNetwork, self).__init__()
-
-        self.checkpoint_file = os.path.join(chkpt_dir, 'progressive_actor_torch_ppo')
-        self.columns = nn.ModuleList([ProgressiveColumn(input_dims, n_actions, alpha, fc1_dims, fc2_dims)])
-
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.to(self.device)
-
-    def forward(self, state, action_mask=None):
-        outputs = [col(state) for col in self.columns]
-        combined_output = sum(outputs) / len(outputs)  # Averaging the outputs
-        dist = F.softmax(combined_output, dim=-1)
-
-        if action_mask is not None:
-            dist = dist * action_mask
-            dist = dist / dist.sum(dim=-1, keepdim=True)
-
-        return T.distributions.Categorical(dist)
-
-    def add_column(self, alpha):
-        new_column = ProgressiveColumn(self.columns[0].fc1.in_features,
-                                       self.columns[0].fc3.out_features,
-                                       alpha,
-                                       prev_columns=self.columns)
-        self.columns.append(new_column)
-
-    def save_checkpoint(self):
-        state_dict = self.state_dict()
-        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-        if not os.path.exists(self.checkpoint_file):
-            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump(state_dict, f)
-
-    def load_checkpoint(self):
-        if not os.path.exists(self.checkpoint_file):
-            return -1
-        with open(self.checkpoint_file, 'r') as f:
-            state_dict = json.load(f)
-        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
-        self.load_state_dict(state_dict)
-
-
-class ProgressiveCriticNetwork(nn.Module):
-    def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='ppo'):
-        super(ProgressiveCriticNetwork, self).__init__()
-
-        self.checkpoint_file = os.path.join(chkpt_dir, 'progressive_critic_torch_ppo')
-        self.columns = nn.ModuleList([ProgressiveColumn(input_dims, 1, alpha, fc1_dims, fc2_dims)])
-
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.to(self.device)
-
-    def forward(self, state):
-        outputs = [col(state) for col in self.columns]
-        return sum(outputs) / len(outputs)  # Averaging the outputs
-
-    def add_column(self, alpha):
-        new_column = ProgressiveColumn(self.columns[0].fc1.in_features,
-                                       self.columns[0].fc3.out_features,
-                                       alpha,
-                                       prev_columns=self.columns)
-        self.columns.append(new_column)
-
-    def save_checkpoint(self):
-        state_dict = self.state_dict()
-        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-        if not os.path.exists(self.checkpoint_file):
-            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump(state_dict, f)
-
-    def load_checkpoint(self):
-        if not os.path.exists(self.checkpoint_file):
-            return -1
-        with open(self.checkpoint_file, 'r') as f:
-            state_dict = json.load(f)
-        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
-        self.load_state_dict(state_dict)
 
 
 class PPOMemory:
@@ -178,119 +128,121 @@ class PPOMemory:
         self.vals = []
 
 
-# class ActorNetwork(nn.Module):
-#     def __init__(self, n_actions, input_dims, alpha,
-#                  fc1_dims=128, fc2_dims=128, n_heads=1, chkpt_dir='ppo'):
-#         super(ActorNetwork, self).__init__()
+class ActorNetwork(nn.Module):
+    def __init__(self, n_actions, input_dims, alpha,
+                 fc1_dims=128, fc2_dims=128, n_heads=1, chkpt_dir='ppo'):
+        super(ActorNetwork, self).__init__()
 
-#         self.checkpoint_file = os.path.join(chkpt_dir, 'multihead_actor_torch_ppo')
-#         self.shared_layers = nn.Sequential(
-#             nn.Linear(input_dims, fc1_dims),
-#             nn.ReLU(),
-#             nn.Linear(fc1_dims, fc2_dims),
-#             nn.ReLU()
-#         )
+        self.checkpoint_file = os.path.join(chkpt_dir, 'multihead_actor_torch_ppo')
+        self.shared_layers = nn.Sequential(
+            nn.Linear(input_dims, fc1_dims),
+            nn.ReLU(),
+            nn.Linear(fc1_dims, fc2_dims),
+            nn.ReLU()
+        )
 
-#         self.heads = nn.ModuleList([nn.Sequential(
-#             nn.Linear(fc2_dims, n_actions),
-#             nn.Softmax(dim=-1)
-#         ) for _ in range(n_heads)])
+        self.heads = nn.ModuleList([nn.Sequential(
+            nn.Linear(fc2_dims, n_actions),
+            nn.Softmax(dim=-1)
+        ) for _ in range(n_heads)])
 
-#         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-#         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-#         self.apply(orthogonal_init)
-#         self.to(self.device)
+        self.optimizer = AdaptivePGD(self.named_parameters(), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.apply(orthogonal_init)
+        self.to(self.device)
 
-#     def forward(self, state, action_mask=None):
-#         shared_output = self.shared_layers(state)
-#         head_outputs = [head(shared_output) for head in self.heads]
+    def forward(self, state, action_mask=None):
+        shared_output = self.shared_layers(state)
+        head_outputs = [head(shared_output) for head in self.heads]
 
-#         if action_mask is not None:
-#             head_outputs = [dist * action_mask for dist in head_outputs]
-#             head_outputs = [dist / dist.sum(dim=-1, keepdim=True) for dist in head_outputs]
+        if action_mask is not None:
+            head_outputs = [dist * action_mask for dist in head_outputs]
+            head_outputs = [dist / dist.sum(dim=-1, keepdim=True) for dist in head_outputs]
 
-#         distributions = [Categorical(dist) for dist in head_outputs]
-#         return distributions
-#     def save_checkpoint(self):
-#         state_dict = self.state_dict()
-#         # Convert tensors to lists for JSON serialization
-#         state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-#         if not os.path.exists(self.checkpoint_file):
-#             os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+        distributions = [Categorical(dist) for dist in head_outputs]
+        return distributions
 
-#         with open(self.checkpoint_file, 'w') as f:
-#             json.dump(state_dict, f)
+    def save_checkpoint(self):
+        state_dict = self.state_dict()
+        # Convert tensors to lists for JSON serialization
+        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
+        if not os.path.exists(self.checkpoint_file):
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
 
-#     def load_checkpoint(self):
-#         if not os.path.exists(self.checkpoint_file):
-#             return -1
-#         with open(self.checkpoint_file, 'r') as f:
-#             state_dict = json.load(f)
-#         # Convert lists back to tensors
-#         state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
-#         self.load_state_dict(state_dict)
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(state_dict, f)
 
-# class CriticNetwork(nn.Module):
-#     def __init__(self, input_dims, alpha, fc1_dims=128, fc2_dims=128,
-#                  n_heads=1, chkpt_dir='ppo'):
-#         super(CriticNetwork, self).__init__()
+    def load_checkpoint(self):
+        if not os.path.exists(self.checkpoint_file):
+            return -1
+        with open(self.checkpoint_file, 'r') as f:
+            state_dict = json.load(f)
+        # Convert lists back to tensors
+        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
+        self.load_state_dict(state_dict)
 
-#         self.checkpoint_file = os.path.join(chkpt_dir, 'multihead_critic_torch_ppo')
-#         self.shared_layers = nn.Sequential(
-#             nn.Linear(input_dims, fc1_dims),
-#             nn.ReLU(),
-#             nn.Linear(fc1_dims, fc2_dims),
-#             nn.ReLU()
-#         )
 
-#         self.heads = nn.ModuleList([nn.Linear(fc2_dims, 1) for _ in range(n_heads)])
+class CriticNetwork(nn.Module):
+    def __init__(self, input_dims, alpha, fc1_dims=128, fc2_dims=128,
+                 n_heads=1, chkpt_dir='ppo'):
+        super(CriticNetwork, self).__init__()
 
-#         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-#         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-#         self.apply(orthogonal_init)
-#         self.to(self.device)
+        self.checkpoint_file = os.path.join(chkpt_dir, 'multihead_critic_torch_ppo')
+        self.shared_layers = nn.Sequential(
+            nn.Linear(input_dims, fc1_dims),
+            nn.ReLU(),
+            nn.Linear(fc1_dims, fc2_dims),
+            nn.ReLU()
+        )
 
-#     def forward(self, state):
-#         shared_output = self.shared_layers(state)
-#         values = [head(shared_output) for head in self.heads]
-#         return values
+        self.heads = nn.ModuleList([nn.Linear(fc2_dims, 1) for _ in range(n_heads)])
 
-#     def save_checkpoint(self):
-#         state_dict = self.state_dict()
-#         # Convert tensors to lists for JSON serialization
-#         state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-#         if not os.path.exists(self.checkpoint_file):
-#             os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
-#         with open(self.checkpoint_file, 'w') as f:
-#             json.dump(state_dict, f)
+        self.optimizer = AdaptivePGD(self.named_parameters(), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.apply(orthogonal_init)
+        self.to(self.device)
 
-#     def load_checkpoint(self):
-#         if not os.path.exists(self.checkpoint_file):
-#             return -1
-#         with open(self.checkpoint_file, 'r') as f:
-#             state_dict = json.load(f)
-#         # Convert lists back to tensors
-#         state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
-#         self.load_state_dict(state_dict)
+    def forward(self, state):
+        shared_output = self.shared_layers(state)
+        values = [head(shared_output) for head in self.heads]
+        return values
+
+    def save_checkpoint(self):
+        state_dict = self.state_dict()
+        # Convert tensors to lists for JSON serialization
+        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
+        if not os.path.exists(self.checkpoint_file):
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(state_dict, f)
+
+    def load_checkpoint(self):
+        if not os.path.exists(self.checkpoint_file):
+            return -1
+        with open(self.checkpoint_file, 'r') as f:
+            state_dict = json.load(f)
+        # Convert lists back to tensors
+        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
+        self.load_state_dict(state_dict)
+
 
 class PPO(RL):
     def __init__(self, exploration):
         super().__init__("PPO")
+        self.is_exploration = exploration
         self.state_dim = 81
         self.n_actions = Action.COUNT
-        self.gamma = 0.99  # Increased from 0.9
-        self.policy_clip = 0.2  # Increased from 0.1
-        self.n_epochs = 4  # Increased from 2
-        self.entropy_coefficient = 0.03
+        self.gamma = 0.9
+        self.policy_clip = 0.3
+        self.n_epochs = 5
+        self.entropy_coefficient = 0.05
         self.gae_lambda = 0.95
-        self.batch_size = 64  # Decreased from 100
-        self.lr = 0.0003
-        self.learn_after = 128  # Decreased from 200
+        batch_size = 64
+        lr = 0.0003
+        # self.learn_after = 200
+        self.learn_after = 100
         self.n_steps = 0
-        self.progress_file = 'progressive_ppo_progress.json'
-        self.epsilon = 0
-        self.is_exploration = False
-
+        self.progress_file = 'ppo_progress.json'
         #     print("- Load data requested")
         #     progress = ai.load_data()
         #     if progress != -1:
@@ -299,17 +251,11 @@ class PPO(RL):
         #         print("- Failed to load data")
         self.epsilon = 0
         self.is_exploration = False
+        self.lr_decay = 0.999
 
-        # self.actor = ActorNetwork(self.n_actions, self.state_dim, lr)
-        # self.critic = CriticNetwork(self.state_dim, lr)
-        self.actor = ProgressiveActorNetwork(self.n_actions, self.state_dim, self.lr)
-        self.critic = ProgressiveCriticNetwork(self.state_dim, self.lr)
-
-        self.memory = PPOMemory(self.batch_size)
-
-    def add_column(self):
-        self.actor.add_column(self.lr)
-        self.critic.add_column(self.lr)
+        self.actor = ActorNetwork(self.n_actions, self.state_dim, lr)
+        self.critic = CriticNetwork(self.state_dim, lr)
+        self.memory = PPOMemory(batch_size)
 
     def encode_state(self, state: State):
         encoded = np.zeros((self.state_dim,), dtype=np.float32)
@@ -359,8 +305,10 @@ class PPO(RL):
 
     def scale_reward(self, reward, step):
         if step == 50:
-            return reward
-        return reward / 10
+            # return reward
+            return reward / 2
+        else:
+            return reward / 100
 
     def execute(self, state, reward, is_terminal=False):
         reward = self.scale_reward(reward, state.step)
@@ -372,9 +320,9 @@ class PPO(RL):
         action_mask = T.tensor(self.state_action_mask(state), dtype=T.float).to(self.actor.device)
 
         distributions = self.actor(state_tensor, action_mask)
-        dist = distributions  # Select the appropriate head
+        dist = distributions[0]  # Select the appropriate head
         values = self.critic(state_tensor)
-        value = values  # Select the appropriate head
+        value = values[0]  # Select the appropriate head
 
         action = dist.sample()
         probs = T.squeeze(dist.log_prob(action)).item()
@@ -412,8 +360,10 @@ class PPO(RL):
                 old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
                 actions = T.tensor(action_arr[batch]).to(self.actor.device)
 
-                dist = self.actor(states)
-                critic_value = self.critic(states)
+                distributions = self.actor(states)
+                dist = distributions[0]  # Select the appropriate head
+                critic_values = self.critic(states)
+                critic_value = critic_values[0]  # Select the appropriate head
 
                 critic_value = T.squeeze(critic_value)
 
@@ -430,13 +380,18 @@ class PPO(RL):
 
                 entropy_loss = dist.entropy().mean()
                 total_loss = actor_loss + 0.5 * critic_loss - self.entropy_coefficient * entropy_loss
-                self.entropy_coefficient *= (1 - 1e-5)
-                self.entropy_coefficient = max(self.entropy_coefficient, 0.001)
-
-                self.actor.columns[-1].optimizer.zero_grad()
-                self.critic.columns[-1].optimizer.zero_grad()
+                self.entropy_coefficient *= (1 - 1e-6)
+                # total_loss = actor_loss + 0.5 * critic_loss
+                self.actor.optimizer.zero_grad()
+                self.critic.optimizer.zero_grad()
                 total_loss.backward()
-                self.actor.columns[-1].optimizer.step()
-                self.critic.columns[-1].optimizer.step()
-
+                self.actor.optimizer.step()
+                self.critic.optimizer.step()
+        for param_group in self.actor.optimizer.param_groups:
+            if param_group['lr'] > 5e-4:
+                param_group['lr'] *= self.lr_decay
+        for param_group in self.critic.optimizer.param_groups:
+            if param_group['lr'] > 5e-4:
+                param_group['lr'] *= self.lr_decay
         self.memory.clear_memory()
+
