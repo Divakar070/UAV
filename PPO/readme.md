@@ -193,8 +193,6 @@ Note that the paper also applies penalty when the UAV moves outside of the map. 
 
 ## The Results
 
-<img width="671" alt="image" src="https://github.com/user-attachments/assets/064072f1-de98-451f-8fc4-11f2415e6b39">
-
 The output of PPO (Proximal Policy Optimization) is indeed produced much faster compared to Q-learning and DQN. PPO is designed to balance stability and efficiency, leveraging its architecture to quickly find effective policies.
 
 The ActorNetwork in PPO uses multiple heads to output action probabilities, while the CriticNetwork evaluates state values. The PPO implementation manages exploration and exploitation through the entropy coefficient, which is decayed over time. Despite the stability improvements provided by the clipped objective function and the use of Generalized Advantage Estimation (GAE) for advantage computation, variability in the learned policy can still occur.
