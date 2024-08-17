@@ -1,16 +1,15 @@
 import json
-import math
 import os
 
 import numpy as np
 import torch as T
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.optim.optimizer import Optimizer
 
 from ai_base import RL, Action, DecayingFloat, State
-
 
 class AdaptivePGD(Optimizer):
     def __init__(
@@ -77,7 +76,6 @@ class AdaptivePGD(Optimizer):
                 perturbed_adaptive_grad = exp_avg / denom / bias_correction1 + noise
                 p.data.add_(perturbed_adaptive_grad, alpha=-group["lr"])
 
-
 def orthogonal_init(layer, gain=1.0):
     if isinstance(layer, nn.Linear):
         nn.init.orthogonal_(layer.weight, gain=gain)
@@ -85,15 +83,196 @@ def orthogonal_init(layer, gain=1.0):
             nn.init.constant_(layer.bias, 0)
 
 
+class ActorNetwork(nn.Module):
+    def __init__(self, input_dim, output_dim, chkpt_dir='ppo'):
+        super(ActorNetwork, self).__init__()
+        self.logits = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim))
+        self.checkpoint_file = os.path.join(chkpt_dir, 'actor_torch_ppo')
+
+    def forward(self, x: T.Tensor, action_mask: T.Tensor):
+        logits = self.logits(x)
+        action_mask = action_mask.to(dtype=T.bool)
+        logits = T.where(action_mask, logits, logits - (1 << 16))
+        return T.distributions.Categorical(logits=logits)
+
+    def save_checkpoint(self):
+        state_dict = self.state_dict()
+        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
+        if not os.path.exists(self.checkpoint_file):
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(state_dict, f)
+
+    def load_checkpoint(self):
+        if not os.path.exists(self.checkpoint_file):
+            return -1
+        with open(self.checkpoint_file, 'r') as f:
+            state_dict = json.load(f)
+        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
+        self.load_state_dict(state_dict)
+
+
+class CriticNetwork(nn.Module):
+    def __init__(self, input_dim, chkpt_dir="ppo"):
+        super(CriticNetwork, self).__init__()
+        self.v = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1))
+        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_torch_ppo')
+
+    def forward(self, x: T.Tensor):
+        v = self.v(x)
+        return v
+
+    def save_checkpoint(self):
+        state_dict = self.state_dict()
+        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
+        if not os.path.exists(self.checkpoint_file):
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(state_dict, f)
+
+    def load_checkpoint(self):
+        if not os.path.exists(self.checkpoint_file):
+            return -1
+        with open(self.checkpoint_file, 'r') as f:
+            state_dict = json.load(f)
+        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
+        self.load_state_dict(state_dict)
+
+
+class ProgressiveColumn(nn.Module):
+    def __init__(self, input_dims, output_dims, alpha, fc1_dims=128, fc2_dims=128, prev_columns=None):
+        super(ProgressiveColumn, self).__init__()
+
+        self.fc1 = nn.Linear(input_dims, fc1_dims)
+        self.fc2 = nn.Linear(fc1_dims + (fc1_dims * len(prev_columns) if prev_columns else 0), fc2_dims)
+        self.fc3 = nn.Linear(fc2_dims + (fc2_dims * len(prev_columns) if prev_columns else 0), output_dims)
+
+        self.prev_columns = prev_columns if prev_columns else []
+
+        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.apply(orthogonal_init)
+        self.to(self.device)
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+
+        lateral_connections1 = [F.relu(col.fc1(state)) for col in self.prev_columns]
+        if lateral_connections1:
+            x = T.cat([x] + lateral_connections1, dim=1)
+
+        x = F.relu(self.fc2(x))
+
+        lateral_connections2 = [F.relu(col.fc2(T.cat([F.relu(col.fc1(state))] +
+                                                     [F.relu(prev_col.fc1(state)) for prev_col in col.prev_columns],
+                                                     dim=1)))
+                                for col in self.prev_columns]
+        if lateral_connections2:
+            x = T.cat([x] + lateral_connections2, dim=1)
+
+        return self.fc3(x)
+
+
+class ProgressiveActorNetwork(nn.Module):
+    def __init__(self, n_actions, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='ppo'):
+        super(ProgressiveActorNetwork, self).__init__()
+
+        self.checkpoint_file = os.path.join(chkpt_dir, 'progressive_actor_torch_ppo')
+        self.columns = nn.ModuleList([ProgressiveColumn(input_dims, n_actions, alpha, fc1_dims, fc2_dims)])
+
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state, action_mask=None):
+        outputs = [col(state) for col in self.columns]
+        combined_output = sum(outputs) / len(outputs)  # Averaging the outputs
+        dist = F.softmax(combined_output, dim=-1)
+
+        if action_mask is not None:
+            dist = dist * action_mask
+            dist = dist / dist.sum(dim=-1, keepdim=True)
+
+        return T.distributions.Categorical(dist)
+
+    def add_column(self, alpha):
+        new_column = ProgressiveColumn(self.columns[0].fc1.in_features,
+                                       self.columns[0].fc3.out_features,
+                                       alpha,
+                                       prev_columns=self.columns)
+        self.columns.append(new_column)
+
+    def save_checkpoint(self):
+        state_dict = self.state_dict()
+        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
+        if not os.path.exists(self.checkpoint_file):
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(state_dict, f)
+
+    def load_checkpoint(self):
+        if not os.path.exists(self.checkpoint_file):
+            return -1
+        with open(self.checkpoint_file, 'r') as f:
+            state_dict = json.load(f)
+        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
+        self.load_state_dict(state_dict)
+
+
+class ProgressiveCriticNetwork(nn.Module):
+    def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256, chkpt_dir='ppo'):
+        super(ProgressiveCriticNetwork, self).__init__()
+
+        self.checkpoint_file = os.path.join(chkpt_dir, 'progressive_critic_torch_ppo')
+        self.columns = nn.ModuleList([ProgressiveColumn(input_dims, 1, alpha, fc1_dims, fc2_dims)])
+
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        outputs = [col(state) for col in self.columns]
+        return sum(outputs) / len(outputs)  # Averaging the outputs
+
+    def add_column(self, alpha):
+        new_column = ProgressiveColumn(self.columns[0].fc1.in_features,
+                                       self.columns[0].fc3.out_features,
+                                       alpha,
+                                       prev_columns=self.columns)
+        self.columns.append(new_column)
+
+    def save_checkpoint(self):
+        state_dict = self.state_dict()
+        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
+        if not os.path.exists(self.checkpoint_file):
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(state_dict, f)
+
+    def load_checkpoint(self):
+        if not os.path.exists(self.checkpoint_file):
+            return -1
+        with open(self.checkpoint_file, 'r') as f:
+            state_dict = json.load(f)
+        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
+        self.load_state_dict(state_dict)
+
+
 class PPOMemory:
     def __init__(self, batch_size):
-        self.states = []
-        self.probs = []
-        self.vals = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-
+        self.clear_memory()
         self.batch_size = batch_size
 
     def generate_batches(self):
@@ -103,21 +282,25 @@ class PPOMemory:
         np.random.shuffle(indices)
         batches = [indices[i:i + self.batch_size] for i in batch_start]
 
-        return self.states, \
+        return np.array(self.states), \
             np.array(self.actions), \
             np.array(self.probs), \
             np.array(self.vals), \
             np.array(self.rewards), \
             np.array(self.dones), \
+            np.array(self.next_states), \
+            np.array(self.actions_masks), \
             batches
 
-    def store_memory(self, state, action, probs, vals, reward, done):
+    def store_memory(self, state, action, probs, vals, reward, done, next_state, actions_mask):
         self.states.append(state)
         self.actions.append(action)
         self.probs.append(probs)
         self.vals.append(vals)
         self.rewards.append(reward)
         self.dones.append(done)
+        self.next_states.append(next_state)
+        self.actions_masks.append(actions_mask)
 
     def clear_memory(self):
         self.states = []
@@ -126,123 +309,29 @@ class PPOMemory:
         self.rewards = []
         self.dones = []
         self.vals = []
-
-
-class ActorNetwork(nn.Module):
-    def __init__(self, n_actions, input_dims, alpha,
-                 fc1_dims=128, fc2_dims=128, n_heads=1, chkpt_dir='ppo'):
-        super(ActorNetwork, self).__init__()
-
-        self.checkpoint_file = os.path.join(chkpt_dir, 'multihead_actor_torch_ppo')
-        self.shared_layers = nn.Sequential(
-            nn.Linear(input_dims, fc1_dims),
-            nn.ReLU(),
-            nn.Linear(fc1_dims, fc2_dims),
-            nn.ReLU()
-        )
-
-        self.heads = nn.ModuleList([nn.Sequential(
-            nn.Linear(fc2_dims, n_actions),
-            nn.Softmax(dim=-1)
-        ) for _ in range(n_heads)])
-
-        self.optimizer = AdaptivePGD(self.named_parameters(), lr=alpha)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.apply(orthogonal_init)
-        self.to(self.device)
-
-    def forward(self, state, action_mask=None):
-        shared_output = self.shared_layers(state)
-        head_outputs = [head(shared_output) for head in self.heads]
-
-        if action_mask is not None:
-            head_outputs = [dist * action_mask for dist in head_outputs]
-            head_outputs = [dist / dist.sum(dim=-1, keepdim=True) for dist in head_outputs]
-
-        distributions = [Categorical(dist) for dist in head_outputs]
-        return distributions
-
-    def save_checkpoint(self):
-        state_dict = self.state_dict()
-        # Convert tensors to lists for JSON serialization
-        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-        if not os.path.exists(self.checkpoint_file):
-            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
-
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump(state_dict, f)
-
-    def load_checkpoint(self):
-        if not os.path.exists(self.checkpoint_file):
-            return -1
-        with open(self.checkpoint_file, 'r') as f:
-            state_dict = json.load(f)
-        # Convert lists back to tensors
-        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
-        self.load_state_dict(state_dict)
-
-
-class CriticNetwork(nn.Module):
-    def __init__(self, input_dims, alpha, fc1_dims=128, fc2_dims=128,
-                 n_heads=1, chkpt_dir='ppo'):
-        super(CriticNetwork, self).__init__()
-
-        self.checkpoint_file = os.path.join(chkpt_dir, 'multihead_critic_torch_ppo')
-        self.shared_layers = nn.Sequential(
-            nn.Linear(input_dims, fc1_dims),
-            nn.ReLU(),
-            nn.Linear(fc1_dims, fc2_dims),
-            nn.ReLU()
-        )
-
-        self.heads = nn.ModuleList([nn.Linear(fc2_dims, 1) for _ in range(n_heads)])
-
-        self.optimizer = AdaptivePGD(self.named_parameters(), lr=alpha)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.apply(orthogonal_init)
-        self.to(self.device)
-
-    def forward(self, state):
-        shared_output = self.shared_layers(state)
-        values = [head(shared_output) for head in self.heads]
-        return values
-
-    def save_checkpoint(self):
-        state_dict = self.state_dict()
-        # Convert tensors to lists for JSON serialization
-        state_dict = {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-        if not os.path.exists(self.checkpoint_file):
-            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump(state_dict, f)
-
-    def load_checkpoint(self):
-        if not os.path.exists(self.checkpoint_file):
-            return -1
-        with open(self.checkpoint_file, 'r') as f:
-            state_dict = json.load(f)
-        # Convert lists back to tensors
-        state_dict = {k: T.tensor(v) for k, v in state_dict.items()}
-        self.load_state_dict(state_dict)
+        self.next_states = []
+        self.actions_masks = []
 
 
 class PPO(RL):
     def __init__(self, exploration):
         super().__init__("PPO")
-        self.is_exploration = exploration
+        self.action_multiplier = 1
         self.state_dim = 81
         self.n_actions = Action.COUNT
-        self.gamma = 0.9
-        self.policy_clip = 0.3
-        self.n_epochs = 5
+        self.gamma = 0.99  # Increased from 0.9
+        self.policy_clip = 0.2  # Increased from 0.1
+        self.n_epochs = 5  # Increased from 2
         self.entropy_coefficient = 0.05
         self.gae_lambda = 0.95
-        batch_size = 64
-        lr = 0.0003
-        # self.learn_after = 200
-        self.learn_after = 100
+        self.batch_size = 1024
+        self.lr = 0.0003
+        self.learn_after = 1024
         self.n_steps = 0
-        self.progress_file = 'ppo_progress.json'
+        self.progress_file = 'progressive_ppo_progress.json'
+        self.epsilon = 0
+        self.is_exploration = True
+
         #     print("- Load data requested")
         #     progress = ai.load_data()
         #     if progress != -1:
@@ -250,12 +339,29 @@ class PPO(RL):
         #     else:
         #         print("- Failed to load data")
         self.epsilon = 0
-        self.is_exploration = False
-        self.lr_decay = 0.999
+        self.is_exploration = True
 
-        self.actor = ActorNetwork(self.n_actions, self.state_dim, lr)
-        self.critic = CriticNetwork(self.state_dim, lr)
-        self.memory = PPOMemory(batch_size)
+        self.device = "cuda:0" if T.cuda.is_available() else "cpu"
+        self.actor = ActorNetwork(self.state_dim, self.n_actions * self.action_multiplier)
+        self.actor.to(self.device)
+        self.actor_optimizer = T.optim.AdamW(self.actor.parameters(), self.lr)
+        self.critic = CriticNetwork(self.state_dim)
+        self.critic.to(self.device)
+        self.critic_optimzer = T.optim.AdamW(self.critic.parameters(), self.lr)
+
+        self.memory = PPOMemory(self.batch_size)
+        self.reset_state()
+
+    def reset_state(self):
+        self.current_state = None
+        self.current_action = None
+        self.current_value = None
+        self.current_log_prob = None
+        self.current_actions_mask = None
+
+    def add_column(self):
+        self.actor.add_column(self.lr)
+        self.critic.add_column(self.lr)
 
     def encode_state(self, state: State):
         encoded = np.zeros((self.state_dim,), dtype=np.float32)
@@ -264,17 +370,19 @@ class PPO(RL):
         encoded[30 + state.step] = 1
         return encoded
 
-    def store_transition(self, state, action, probs, vals, reward, done):
-        self.memory.store_memory(state, action, probs, vals, reward, done)
+    def store_transition(self, state, action, probs, vals, reward, done, next_state, actions_mask):
+        self.memory.store_memory(state, action, probs, vals, reward, done, next_state, actions_mask)
 
-    # def state_to_tensor(self, state:State):
-    #     return T.tensor(self.encode_state(state), dtype=T.float32)
     def state_to_numpy(self, state: State):
         return np.array(self.encode_state(state), dtype=np.float32)
 
     def state_action_mask(self, state: State):
-        mask = np.zeros((self.n_actions,), dtype=np.float32)
-        mask[state.valid_actions()] = 1.0
+        mask = np.zeros((self.n_actions * self.action_multiplier,), dtype=np.float32)
+        valid_actions = state.valid_actions()
+        for i in range(self.action_multiplier):
+            start = i * self.n_actions
+            end = start + self.n_actions
+            mask[start: end][valid_actions] = 1.0
         return mask
 
     def save_data(self, round_id):
@@ -305,93 +413,131 @@ class PPO(RL):
 
     def scale_reward(self, reward, step):
         if step == 50:
-            # return reward
-            return reward / 2
-        else:
-            return reward / 100
+            return reward / 10
+        return reward / 100
 
     def execute(self, state, reward, is_terminal=False):
-        reward = self.scale_reward(reward, state.step)
-        if (state.col == 0 and state.row == 14) or state.step == 50:
+        if (state.col == 0 and state.row == 14 and state.step != 0) or state.step == 50:
             is_terminal = True
-        state_np = self.state_to_numpy(state)
+        if self.current_state is not None and self.is_exploration:
+            reward = self.scale_reward(reward, state.step)
+            self.store_transition(self.state_to_numpy(self.current_state), self.current_action, self.current_log_prob,
+                                  self.current_value, reward, is_terminal, self.state_to_numpy(state),
+                                  self.current_actions_mask)
+            self.n_steps += 1
+            if self.n_steps % self.learn_after == 0:
+                self.learn()
 
-        state_tensor = T.tensor(state_np, dtype=T.float).to(self.actor.device)
-        action_mask = T.tensor(self.state_action_mask(state), dtype=T.float).to(self.actor.device)
+        if is_terminal:
+            self.reset_state()
+            return -1
+
+        state_np = self.state_to_numpy(state)
+        state_tensor = T.tensor(state_np, dtype=T.float).to(self.device).unsqueeze(0)
+        action_mask = T.tensor(self.state_action_mask(state), dtype=T.float).to(self.device).unsqueeze(0)
 
         distributions = self.actor(state_tensor, action_mask)
-        dist = distributions[0]  # Select the appropriate head
+        dist: T.distributions.Categorical = distributions  # Select the appropriate head
         values = self.critic(state_tensor)
-        value = values[0]  # Select the appropriate head
-
-        action = dist.sample()
-        probs = T.squeeze(dist.log_prob(action)).item()
-        action = T.squeeze(action).item()
-        value = T.squeeze(value).item()
-        self.n_steps += 1
-        self.store_transition(state_np, action, probs, value, reward, is_terminal)
-
-        if self.n_steps % self.learn_after == 0:
-            self.learn()
-
-        return action
+        value = values  # Select the appropriate head
+        if self.is_exploration is False:
+            action = T.argmax(dist.probs, dim=-1)
+            self.reset_state()
+        else:
+            action = dist.sample()
+            probs = T.squeeze(dist.log_prob(action)).item()
+            action = T.squeeze(action).item()
+            value = T.squeeze(value).item()
+            self.current_state = state
+            self.current_action = action
+            self.current_log_prob = probs
+            self.current_value = value
+            self.current_actions_mask = action_mask.cpu().numpy()[0]
+        # number of action is higher than the number of actions
+        return action % self.n_actions
 
     def learn(self):
         for _ in range(self.n_epochs):
-            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, batches = \
+            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, next_states_arr, actions_masks_arr, batches = \
                 self.memory.generate_batches()
 
             values = vals_arr
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
+            last_state_np = next_states_arr[-1]
+            last_state_tensor = T.tensor(last_state_np, dtype=T.float, device=self.device)
+            with T.no_grad():
+                last_value = self.critic(last_state_tensor).squeeze(-1).cpu().item()
+            advantage, returns = self.calculate_advantages_and_returns(reward_arr, vals_arr, dones_arr, last_value)
 
-            for t in range(len(reward_arr) - 1):
-                discount = 1
-                a_t = 0
-                for k in range(t, len(reward_arr) - 1):
-                    a_t += discount * (reward_arr[k] + self.gamma * values[k + 1] *
-                                       (1 - int(dones_arr[k])) - values[k])
-                    discount *= self.gamma * self.gae_lambda
-                advantage[t] = a_t
-            advantage = T.tensor(advantage).to(self.actor.device)
-
-            values = T.tensor(values).to(self.actor.device)
+            values = T.tensor(values).to(self.device)
             for batch in batches:
-                states = T.tensor([state_arr[i] for i in batch], dtype=T.float).to(self.actor.device)
-                old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
-                actions = T.tensor(action_arr[batch]).to(self.actor.device)
-
-                distributions = self.actor(states)
-                dist = distributions[0]  # Select the appropriate head
-                critic_values = self.critic(states)
-                critic_value = critic_values[0]  # Select the appropriate head
+                states = T.tensor(state_arr[batch], dtype=T.float, device=self.device)
+                old_probs = T.tensor(old_prob_arr[batch], dtype=T.float, device=self.device)
+                actions = T.tensor(action_arr[batch], device=self.device)
+                returns_batch = T.tensor(returns[batch], dtype=T.float, device=self.device)
+                advantage_batch = T.tensor(advantage[batch], dtype=T.float, device=self.device)
+                advantage_batch = (advantage_batch - advantage_batch.mean()) / (advantage_batch.std() + 1e-8)
+                advantage_batch = advantage_batch.clip(-10, 10)
+                actions_masks_batch = T.tensor(actions_masks_arr[batch], dtype=T.float, device=self.device)
+                dist = self.actor(states, actions_masks_batch)
+                critic_value = self.critic(states)
 
                 critic_value = T.squeeze(critic_value)
 
                 new_probs = dist.log_prob(actions)
                 prob_ratio = new_probs.exp() / old_probs.exp()
-                weighted_probs = advantage[batch] * prob_ratio
+                weighted_probs = advantage_batch * prob_ratio
                 weighted_clipped_probs = T.clamp(prob_ratio, 1 - self.policy_clip,
-                                                 1 + self.policy_clip) * advantage[batch]
+                                                 1 + self.policy_clip) * advantage_batch
                 actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
 
-                returns = advantage[batch] + values[batch]
-                critic_loss = (returns - critic_value) ** 2
-                critic_loss = critic_loss.mean()
+                # returns_batch = advantage[batch] + values[batch]
+                criterion = T.nn.HuberLoss()
+                critic_loss = criterion(critic_value, returns_batch)
+                # critic_loss = (returns_batch - critic_value) ** 2
+                # critic_loss = critic_loss.mean()
 
                 entropy_loss = dist.entropy().mean()
                 total_loss = actor_loss + 0.5 * critic_loss - self.entropy_coefficient * entropy_loss
-                self.entropy_coefficient *= (1 - 1e-6)
-                # total_loss = actor_loss + 0.5 * critic_loss
-                self.actor.optimizer.zero_grad()
-                self.critic.optimizer.zero_grad()
+
+                self.actor_optimizer.zero_grad()
+                self.critic_optimzer.zero_grad()
                 total_loss.backward()
-                self.actor.optimizer.step()
-                self.critic.optimizer.step()
-        for param_group in self.actor.optimizer.param_groups:
-            if param_group['lr'] > 5e-4:
-                param_group['lr'] *= self.lr_decay
-        for param_group in self.critic.optimizer.param_groups:
-            if param_group['lr'] > 5e-4:
-                param_group['lr'] *= self.lr_decay
+
+                from torch.nn.utils import clip_grad_norm_
+                # clip_grad_norm_(self.actor.parameters(),1)
+                # clip_grad_norm_(self.critic.parameters(),1)
+                self.actor_optimizer.step()
+                self.critic_optimzer.step()
+
+        self.entropy_coefficient *= (1 - 1e-5) ** len(batches)
+        self.entropy_coefficient = max(self.entropy_coefficient, 0.001)
         self.memory.clear_memory()
+
+    def calculate_advantages_and_returns(self, rewards, values, dones, last_value):
+        sample_size = len(rewards)
+        advantages = np.zeros_like(rewards)
+        returns = np.zeros_like(rewards)
+
+        next_val = last_value
+        next_adv = 0
+        for t in reversed(range(sample_size)):
+            current_terminal = dones[t]
+            current_reward = rewards[t]
+            current_value = values[t]
+
+            if current_terminal:
+                next_val = 0
+                next_adv = 0
+
+            delta = current_reward + self.gamma * next_val - current_value
+            current_adv = delta + self.gamma * self.gae_lambda * next_adv
+
+            next_adv = current_adv
+            next_val = current_value
+
+            advantages[t] = current_adv
+            returns[t] = current_adv + current_value
+        return advantages, returns
+
+
 
